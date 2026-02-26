@@ -42,6 +42,47 @@ namespace
 	WNDPROC g_originalMainWndProc = nullptr;
 	HWND g_editorMainWindow = nullptr;
 	bool g_menuInstalled = false;
+	HANDLE g_installThread = nullptr;
+
+	bool InstallEditorMenuHook();
+	void EnsureEditorMenuHookInstalled();
+
+
+	struct WindowSearchContext
+	{
+		DWORD processId = 0;
+		HWND found = nullptr;
+	};
+
+	BOOL CALLBACK EnumWindowsFindEditorMain(HWND hWnd, LPARAM lParam)
+	{
+		WindowSearchContext* ctx = reinterpret_cast<WindowSearchContext*>(lParam);
+		if (!ctx) {
+			return TRUE;
+		}
+		DWORD pid = 0;
+		GetWindowThreadProcessId(hWnd, &pid);
+		if (pid != ctx->processId) {
+			return TRUE;
+		}
+		if (!IsWindowVisible(hWnd)) {
+			return TRUE;
+		}
+		HMENU menu = GetMenu(hWnd);
+		if (!menu || GetMenuItemCount(menu) <= 0) {
+			return TRUE;
+		}
+		ctx->found = hWnd;
+		return FALSE;
+	}
+
+	HWND FindEditorMainWindow()
+	{
+		WindowSearchContext ctx;
+		ctx.processId = GetCurrentProcessId();
+		EnumWindows(EnumWindowsFindEditorMain, reinterpret_cast<LPARAM>(&ctx));
+		return ctx.found;
+	}
 
 	struct RevoiceRow
 	{
@@ -644,6 +685,32 @@ namespace
 		MessageBoxA(g_editorMainWindow, ss.str().c_str(), "Export reVoice CSV <- Active Plugin", MB_OK | MB_ICONINFORMATION);
 	}
 
+
+	DWORD WINAPI DeferredInstallThreadProc(LPVOID)
+	{
+		for (int i = 0; i < 120 && !g_menuInstalled; ++i)
+		{
+			if (InstallEditorMenuHook()) {
+				break;
+			}
+			Sleep(250);
+		}
+		return 0;
+	}
+
+	void EnsureEditorMenuHookInstalled()
+	{
+		if (g_menuInstalled) {
+			return;
+		}
+		if (InstallEditorMenuHook()) {
+			return;
+		}
+		if (!g_installThread) {
+			g_installThread = CreateThread(nullptr, 0, DeferredInstallThreadProc, nullptr, 0, nullptr);
+		}
+	}
+
 	LRESULT CALLBACK HookedEditorWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	{
 		if (message == WM_COMMAND)
@@ -669,12 +736,9 @@ namespace
 			return true;
 		}
 
-		g_editorMainWindow = FindWindowA(nullptr, "TES Construction Set");
+		g_editorMainWindow = FindEditorMainWindow();
 		if (!g_editorMainWindow) {
-			g_editorMainWindow = GetForegroundWindow();
-		}
-		if (!g_editorMainWindow) {
-			_MESSAGE("reVoice: could not locate editor main window");
+			_MESSAGE("reVoice: could not locate editor main window yet");
 			return false;
 		}
 
@@ -690,10 +754,12 @@ namespace
 			return false;
 		}
 
-		AppendMenuA(fileMenu, MF_SEPARATOR, 0, nullptr);
-		AppendMenuA(fileMenu, MF_STRING, kMenuCommand_ImportRevoiceCsv, kMenuLabel_Import);
-		AppendMenuA(fileMenu, MF_STRING, kMenuCommand_ExportRevoiceCsv, kMenuLabel_Export);
-		DrawMenuBar(g_editorMainWindow);
+		if (GetMenuState(fileMenu, kMenuCommand_ImportRevoiceCsv, MF_BYCOMMAND) == 0xFFFFFFFF) {
+			AppendMenuA(fileMenu, MF_SEPARATOR, 0, nullptr);
+			AppendMenuA(fileMenu, MF_STRING, kMenuCommand_ImportRevoiceCsv, kMenuLabel_Import);
+			AppendMenuA(fileMenu, MF_STRING, kMenuCommand_ExportRevoiceCsv, kMenuLabel_Export);
+			DrawMenuBar(g_editorMainWindow);
+		}
 
 		g_originalMainWndProc = (WNDPROC)SetWindowLongPtr(g_editorMainWindow, GWLP_WNDPROC, (LONG_PTR)HookedEditorWndProc);
 		g_menuInstalled = (g_originalMainWndProc != nullptr);
@@ -768,7 +834,7 @@ bool OBSEPlugin_Load(const OBSEInterface* obse)
 	g_pluginHandle = obse->GetPluginHandle();
 
 	if (obse->isEditor) {
-		InstallEditorMenuHook();
+		EnsureEditorMenuHookInstalled();
 		_MESSAGE("Plugin_Load: Editor hooks attempted");
 	}
 	else {
