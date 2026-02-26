@@ -25,6 +25,7 @@
 #include <shlobj.h>
 #include <windows.h>
 #include <commdlg.h>
+#include <shlwapi.h>
 
 PluginHandle g_pluginHandle = kPluginHandle_Invalid;
 
@@ -82,6 +83,42 @@ namespace
 		ctx.processId = GetCurrentProcessId();
 		EnumWindows(EnumWindowsFindEditorMain, reinterpret_cast<LPARAM>(&ctx));
 		return ctx.found;
+	}
+
+
+	bool MenuTextContains(HMENU menu, int index, const char* token)
+	{
+		char buffer[256] = {0};
+		MENUITEMINFOA info = {0};
+		info.cbSize = sizeof(info);
+		info.fMask = MIIM_STRING | MIIM_FTYPE;
+		info.dwTypeData = buffer;
+		info.cch = sizeof(buffer) - 1;
+		if (!GetMenuItemInfoA(menu, index, TRUE, &info)) {
+			return false;
+		}
+		if (info.fType & MFT_SEPARATOR) {
+			return false;
+		}
+		return StrStrIA(buffer, token) != nullptr;
+	}
+
+	HMENU FindOrCreateFilePopup(HMENU fileMenu, const char* token)
+	{
+		const int count = GetMenuItemCount(fileMenu);
+		for (int i = 0; i < count; ++i)
+		{
+			if (!MenuTextContains(fileMenu, i, token)) {
+				continue;
+			}
+			HMENU sub = GetSubMenu(fileMenu, i);
+			if (sub) {
+				return sub;
+			}
+		}
+		HMENU created = CreatePopupMenu();
+		AppendMenuA(fileMenu, MF_POPUP | MF_STRING, (UINT_PTR)created, token);
+		return created;
 	}
 
 	struct RevoiceRow
@@ -590,6 +627,7 @@ namespace
 
 	void ExportRevoiceCsvForActivePlugin()
 	{
+		__try {
 		DataHandler* handler = GetEditorDataHandler();
 		ModEntry::Data* activeFile = GetActivePlugin();
 		if (!handler || !activeFile) {
@@ -683,6 +721,12 @@ namespace
 		std::ostringstream ss;
 		ss << "reVoice export complete.\n\nExported rows: " << exported << "\nSkipped rows: " << skipped << "\nOutput: " << filePath;
 		MessageBoxA(g_editorMainWindow, ss.str().c_str(), "Export reVoice CSV <- Active Plugin", MB_OK | MB_ICONINFORMATION);
+		}
+		__except(EXCEPTION_EXECUTE_HANDLER)
+		{
+			MessageBoxA(g_editorMainWindow, "Export failed due to an unexpected editor memory layout mismatch. No changes were applied.", "Export reVoice CSV", MB_OK | MB_ICONERROR);
+			_MESSAGE("reVoice export crashed and was caught by SEH guard");
+		}
 	}
 
 
@@ -754,12 +798,16 @@ namespace
 			return false;
 		}
 
-		if (GetMenuState(fileMenu, kMenuCommand_ImportRevoiceCsv, MF_BYCOMMAND) == 0xFFFFFFFF) {
-			AppendMenuA(fileMenu, MF_SEPARATOR, 0, nullptr);
-			AppendMenuA(fileMenu, MF_STRING, kMenuCommand_ImportRevoiceCsv, kMenuLabel_Import);
-			AppendMenuA(fileMenu, MF_STRING, kMenuCommand_ExportRevoiceCsv, kMenuLabel_Export);
-			DrawMenuBar(g_editorMainWindow);
+		HMENU importPopup = FindOrCreateFilePopup(fileMenu, "Import");
+		HMENU exportPopup = FindOrCreateFilePopup(fileMenu, "Export");
+
+		if (GetMenuState(importPopup, kMenuCommand_ImportRevoiceCsv, MF_BYCOMMAND) == 0xFFFFFFFF) {
+			AppendMenuA(importPopup, MF_STRING, kMenuCommand_ImportRevoiceCsv, "reVoice CSV -> Active Plugin");
 		}
+		if (GetMenuState(exportPopup, kMenuCommand_ExportRevoiceCsv, MF_BYCOMMAND) == 0xFFFFFFFF) {
+			AppendMenuA(exportPopup, MF_STRING, kMenuCommand_ExportRevoiceCsv, "reVoice CSV <- Active Plugin");
+		}
+		DrawMenuBar(g_editorMainWindow);
 
 		g_originalMainWndProc = (WNDPROC)SetWindowLongPtr(g_editorMainWindow, GWLP_WNDPROC, (LONG_PTR)HookedEditorWndProc);
 		g_menuInstalled = (g_originalMainWndProc != nullptr);
