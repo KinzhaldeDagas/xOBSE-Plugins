@@ -5,12 +5,13 @@
 #include "obse/PluginAPI.h"
 #include "obse_common/SafeWrite.h"
 // Legacy SDK
-#include "obse/CommandTable.h" // Required for new functions
+#include "obse/CommandTable.h"
 #include "obse/ParamInfos.h"
 #include "obse/GameObjects.h"
 #include "obse/GameOSDepend.h"
-#include "obse/Script.h" // OBSE Only
+#include "obse/Script.h"
 #include "obse/GameData.h"
+#include "obse/GameForms.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -18,21 +19,21 @@
 #include <sstream>
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
+
 // Windows
-#include <shlobj.h>	// CSIDL_MYCODUMENTS
+#include <shlobj.h>
 #include <windows.h>
 #include <commdlg.h>
-
-// ================================
-// Handles
-// ================================
 
 PluginHandle g_pluginHandle = kPluginHandle_Invalid;
 
 namespace
 {
 	constexpr UINT kMenuCommand_ImportRevoiceCsv = 0x7F50;
-	constexpr const char* kMenuLabel = "reVoice CSV -> Active Plugin...";
+	constexpr UINT kMenuCommand_ExportRevoiceCsv = 0x7F51;
+	constexpr const char* kMenuLabel_Import = "Import reVoice CSV -> Active Plugin...";
+	constexpr const char* kMenuLabel_Export = "Export reVoice CSV <- Active Plugin...";
 
 	typedef TESForm* (*_EditorLookupFormByID)(UInt32 id);
 	const _EditorLookupFormByID EditorLookupFormByID = (_EditorLookupFormByID)0x00495EF0;
@@ -50,195 +51,187 @@ namespace
 		std::string outputPath;
 		std::string dialogue;
 		UInt32 lineNumber = 0;
+		UInt32 responseNumber = 0;
 	};
 
 	struct ImportSummary
 	{
-		UInt32 processed = 0;
+		UInt32 parsedRows = 0;
 		UInt32 applied = 0;
 		UInt32 skipped = 0;
 		UInt32 warnings = 0;
 		UInt32 errors = 0;
+		UInt32 dialogueMismatch = 0;
+		UInt32 pathMismatch = 0;
 		std::vector<std::string> diagnostics;
 	};
 
-	std::string Trim(const std::string& value)
+	struct SpeakerContext
+	{
+		bool concrete = false;
+		std::string voiceID = "ob_unknown";
+		std::string speakerInfo = "Unknown\\M";
+		std::string outputFolder = "Unknown\\M";
+	};
+
+	struct EditorResponseData
+	{
+		UInt32 unk00;
+		UInt32 unk04;
+		UInt32 unk08;
+		UInt32 unk0C;
+		BSStringT responseText;
+		UInt32 responseNumber;
+	};
+
+	struct EditorTopicInfo
+	{
+		TESForm base;
+		TESTopic* unk24;
+		ConditionEntry conditions;
+		UInt16 unk30;
+		UInt16 infotype;
+		UInt8 flags0;
+		UInt8 pad35[3];
+		tList<TESTopic> addedTopics;
+		void* linkedTopics;
+		tList<EditorResponseData> responseList;
+		Script resultScript;
+	};
+
+	std::string Trim(const std::string& in)
 	{
 		size_t start = 0;
-		while (start < value.size() && std::isspace((unsigned char)value[start])) {
+		while (start < in.size() && std::isspace((unsigned char)in[start])) {
 			++start;
 		}
-		size_t end = value.size();
-		while (end > start && std::isspace((unsigned char)value[end - 1])) {
+		size_t end = in.size();
+		while (end > start && std::isspace((unsigned char)in[end - 1])) {
 			--end;
 		}
-		return value.substr(start, end - start);
+		return in.substr(start, end - start);
+	}
+
+	std::string SanitizePathComponent(const std::string& in)
+	{
+		std::string out;
+		out.reserve(in.size());
+		for (char ch : in)
+		{
+			if (std::isalnum((unsigned char)ch) || ch == '_' || ch == '-' || ch == ' ') {
+				out.push_back(ch);
+			}
+			else {
+				out.push_back('_');
+			}
+		}
+		out = Trim(out);
+		return out.empty() ? "Unknown" : out;
 	}
 
 	std::vector<std::string> ParseDelimitedLine(const std::string& line, char delimiter)
 	{
 		std::vector<std::string> out;
-		std::string cell;
+		std::string current;
 		bool inQuotes = false;
 		for (size_t i = 0; i < line.size(); ++i)
 		{
-			char c = line[i];
-			if (c == '"')
+			char ch = line[i];
+			if (ch == '"')
 			{
 				if (inQuotes && i + 1 < line.size() && line[i + 1] == '"') {
-					cell.push_back('"');
+					current.push_back('"');
 					++i;
 				}
 				else {
 					inQuotes = !inQuotes;
 				}
-				continue;
 			}
-			if (!inQuotes && c == delimiter)
+			else if (ch == delimiter && !inQuotes)
 			{
-				out.push_back(cell);
-				cell.clear();
-				continue;
+				out.push_back(current);
+				current.clear();
 			}
-			cell.push_back(c);
+			else {
+				current.push_back(ch);
+			}
 		}
-		out.push_back(cell);
+		out.push_back(current);
 		return out;
 	}
 
-	bool ParseHexFormID(const std::string& token, UInt32& outFormID)
+	bool ParseHexFormID(const std::string& text, UInt32& outFormID)
 	{
-		std::string t = Trim(token);
-		if (t.size() != 8) {
+		std::string clean = Trim(text);
+		if (clean.size() != 8) {
 			return false;
 		}
-		for (char c : t) {
-			if (!std::isxdigit((unsigned char)c)) {
+		for (char ch : clean) {
+			if (!std::isxdigit((unsigned char)ch)) {
 				return false;
 			}
 		}
-		outFormID = strtoul(t.c_str(), nullptr, 16);
+		outFormID = strtoul(clean.c_str(), nullptr, 16);
 		return true;
 	}
 
-	bool NormalizeOutputPath(const std::string& inPath, std::string& outPath)
+	std::string NormalizeVoiceOutputPath(const std::string& raw)
 	{
-		std::string t = Trim(inPath);
-		if (t.empty()) {
-			return false;
+		std::string path = Trim(raw);
+		std::replace(path.begin(), path.end(), '/', '\\');
+		while (!path.empty() && (path.front() == '\\' || path.front() == '/')) {
+			path.erase(path.begin());
 		}
-
-		std::replace(t.begin(), t.end(), '/', '\\');
-		if (t.size() >= 2 && std::isalpha((unsigned char)t[0]) && t[1] == ':') {
-			t = t.substr(2);
+		if (path.size() > 1 && std::isalpha((unsigned char)path[0]) && path[1] == ':') {
+			path = path.substr(2);
 		}
-		while (!t.empty() && (t[0] == '\\' || t[0] == '/')) {
-			t.erase(t.begin());
+		while (!path.empty() && (path.front() == '\\' || path.front() == '/')) {
+			path.erase(path.begin());
+		}
+		if (_strnicmp(path.c_str(), "Data\\", 5) == 0) {
+			path = path.substr(5);
 		}
 
 		std::string collapsed;
-		collapsed.reserve(t.size());
-		bool lastSlash = false;
-		for (char c : t)
+		collapsed.reserve(path.size());
+		bool prevSlash = false;
+		for (char ch : path)
 		{
-			if (c == '\\') {
-				if (!lastSlash) {
-					collapsed.push_back(c);
-				}
-				lastSlash = true;
+			const bool slash = (ch == '\\');
+			if (slash && prevSlash) {
+				continue;
 			}
-			else {
-				collapsed.push_back(c);
-				lastSlash = false;
-			}
+			collapsed.push_back(ch);
+			prevSlash = slash;
 		}
 
 		if (_strnicmp(collapsed.c_str(), "Sound\\Voice\\", 12) != 0) {
-			return false;
+			return "";
 		}
-
-		for (char c : collapsed) {
-			if ((unsigned char)c < 32 || c == '|' || c == '"' || c == '<' || c == '>' || c == '?') {
-				return false;
-			}
+		if (collapsed.find("..") != std::string::npos) {
+			return "";
 		}
-
-		outPath = collapsed;
-		return true;
+		return collapsed;
 	}
 
-	bool IsHeaderRow(const std::vector<std::string>& cells)
+	UInt32 ParseResponseNumberFromPath(const std::string& outputPath)
 	{
-		if (cells.size() < 5) {
-			return false;
+		auto dot = outputPath.find_last_of('.');
+		std::string base = dot == std::string::npos ? outputPath : outputPath.substr(0, dot);
+		auto under = base.find_last_of('_');
+		if (under == std::string::npos) {
+			return 0;
 		}
-		return _stricmp(Trim(cells[0]).c_str(), "FormID") == 0
-			&& _stricmp(Trim(cells[1]).c_str(), "VoiceID") == 0
-			&& _stricmp(Trim(cells[2]).c_str(), "SpeakerInfo") == 0
-			&& _stricmp(Trim(cells[3]).c_str(), "OutputPath") == 0
-			&& _stricmp(Trim(cells[4]).c_str(), "Dialogue") == 0;
-	}
-
-	std::vector<RevoiceRow> ParseRevoiceFile(const std::string& filePath, ImportSummary& summary)
-	{
-		std::vector<RevoiceRow> rows;
-		std::ifstream file(filePath, std::ios::binary);
-		if (!file.is_open()) {
-			summary.errors++;
-			summary.diagnostics.push_back("Could not open file.");
-			return rows;
+		std::string tail = base.substr(under + 1);
+		if (tail.empty()) {
+			return 0;
 		}
-
-		std::string line;
-		UInt32 lineNumber = 0;
-		while (std::getline(file, line))
-		{
-			++lineNumber;
-			if (!line.empty() && line.back() == '\r') {
-				line.pop_back();
+		for (char ch : tail) {
+			if (!std::isdigit((unsigned char)ch)) {
+				return 0;
 			}
-			if (lineNumber == 1 && line.size() >= 3 && (unsigned char)line[0] == 0xEF && (unsigned char)line[1] == 0xBB && (unsigned char)line[2] == 0xBF) {
-				line = line.substr(3);
-			}
-			if (Trim(line).empty()) {
-				continue;
-			}
-
-			const char delimiter = (line.find('\t') != std::string::npos) ? '\t' : ',';
-			auto cells = ParseDelimitedLine(line, delimiter);
-			if (lineNumber == 1 && IsHeaderRow(cells)) {
-				continue;
-			}
-			if (cells.size() < 5) {
-				summary.errors++;
-				summary.diagnostics.push_back("Line " + std::to_string(lineNumber) + ": expected 5 columns.");
-				continue;
-			}
-
-			RevoiceRow row{};
-			row.lineNumber = lineNumber;
-			if (!ParseHexFormID(cells[0], row.formID)) {
-				summary.errors++;
-				summary.diagnostics.push_back("Line " + std::to_string(lineNumber) + ": invalid FormID.");
-				continue;
-			}
-			row.voiceID = Trim(cells[1]);
-			row.speakerInfo = Trim(cells[2]);
-			if (!NormalizeOutputPath(cells[3], row.outputPath)) {
-				summary.errors++;
-				summary.diagnostics.push_back("Line " + std::to_string(lineNumber) + ": invalid OutputPath.");
-				continue;
-			}
-			row.dialogue = Trim(cells[4]);
-			if (row.dialogue.empty()) {
-				summary.errors++;
-				summary.diagnostics.push_back("Line " + std::to_string(lineNumber) + ": Dialogue is required.");
-				continue;
-			}
-			rows.push_back(std::move(row));
 		}
-
-		return rows;
+		return static_cast<UInt32>(atoi(tail.c_str()));
 	}
 
 	bool IsEditorLoaded()
@@ -246,114 +239,237 @@ namespace
 		return g_editorDataHandler && *g_editorDataHandler;
 	}
 
+	DataHandler* GetEditorDataHandler()
+	{
+		return IsEditorLoaded() ? *g_editorDataHandler : nullptr;
+	}
+
 	ModEntry::Data* GetActivePlugin()
 	{
-		if (!IsEditorLoaded()) {
+		DataHandler* handler = GetEditorDataHandler();
+		if (!handler) {
 			return nullptr;
 		}
-		return (*g_editorDataHandler)->unk8B8.activeFile;
+		return handler->unk8B8.activeFile;
 	}
 
-	bool IsConcreteSpeakerContext(const RevoiceRow& row)
+	SpeakerContext BuildSpeakerContext(EditorTopicInfo* info)
 	{
-		if (row.speakerInfo.empty()) {
-			return false;
-		}
-		const std::string lower = [&row]() {
-			std::string s = row.speakerInfo;
-			for (char& c : s) c = (char)std::tolower((unsigned char)c);
-			return s;
-		}();
-		if (lower.find("all races") != std::string::npos || lower.find("allrace") != std::string::npos) {
-			return false;
-		}
-		return true;
-	}
-
-	bool ApplyRowToActivePlugin(const RevoiceRow& row, ModEntry::Data* activeFile, ImportSummary& summary)
-	{
-		TESForm* form = EditorLookupFormByID ? EditorLookupFormByID(row.formID) : nullptr;
-		if (!form) {
-			summary.errors++;
-			summary.diagnostics.push_back("Line " + std::to_string(row.lineNumber) + ": FormID not found.");
-			return false;
-		}
-		if (form->typeID != 0x3A) {
-			summary.skipped++;
-			summary.warnings++;
-			summary.diagnostics.push_back("Line " + std::to_string(row.lineNumber) + ": target is not INFO.");
-			return false;
-		}
-		if (!IsConcreteSpeakerContext(row)) {
-			summary.skipped++;
-			summary.warnings++;
-			summary.diagnostics.push_back("Line " + std::to_string(row.lineNumber) + ": skipped non-concrete speaker context.");
-			return false;
+		SpeakerContext ctx;
+		if (!info) {
+			return ctx;
 		}
 
-		const UInt8 formModIndex = (row.formID >> 24) & 0xFF;
-		const UInt8 activeModIndex = (UInt8)(activeFile->idx & 0xFF);
-		if (formModIndex != activeModIndex) {
-			summary.skipped++;
-			summary.warnings++;
-			summary.diagnostics.push_back("Line " + std::to_string(row.lineNumber) + ": FormID not in active plugin (no master write)." );
-			return false;
-		}
+		TESForm* raceForm = nullptr;
+		TESForm* idForm = nullptr;
+		int sex = -1;
 
-		// NOTE:
-		// Public CSE SDK headers in this tree do not expose an editor-safe TESTopicInfo
-		// response/voice-path mutator for Oblivion (INFO response fields are incomplete).
-		// We therefore record a successful "apply candidate" pass here after all guardrails,
-		// and log the canonical voice path that should be written by an engine-level mutator.
-		_MESSAGE("reVoice import apply-candidate FormID=%08X OutputPath=%s SpeakerInfo=%s", row.formID, row.outputPath.c_str(), row.speakerInfo.c_str());
-		summary.applied++;
-		return true;
-	}
-
-	void ShowSummaryDialog(const ImportSummary& summary)
-	{
-		std::ostringstream ss;
-		ss << "reVoice CSV import complete\n\n"
-			<< "Processed: " << summary.processed << "\n"
-			<< "Applied: " << summary.applied << "\n"
-			<< "Skipped: " << summary.skipped << "\n"
-			<< "Warnings: " << summary.warnings << "\n"
-			<< "Errors: " << summary.errors;
-		if (!summary.diagnostics.empty()) {
-			ss << "\n\nTop diagnostics:\n";
-			const size_t maxRows = std::min<size_t>(summary.diagnostics.size(), 12);
-			for (size_t i = 0; i < maxRows; ++i) {
-				ss << "- " << summary.diagnostics[i] << "\n";
+		for (ConditionEntry* node = &info->conditions; node; node = node->next)
+		{
+			if (!node->data) {
+				continue;
+			}
+			const UInt16 fn = node->data->functionIndex & 0x0FFF;
+			if (fn == 224 && node->data->param1.form) {
+				raceForm = node->data->param1.form;
+			}
+			else if (fn == 72 && node->data->param1.form) {
+				idForm = node->data->param1.form;
+			}
+			else if (fn == 69) {
+				const int sexVal = static_cast<int>(node->data->comparisonValue);
+				if (sexVal == 0 || sexVal == 1) {
+					sex = sexVal;
+				}
 			}
 		}
-		MessageBoxA(g_editorMainWindow, ss.str().c_str(), "reVoice CSV -> Active Plugin", MB_OK | MB_ICONINFORMATION);
+
+		if (raceForm && raceForm->typeID == kFormType_Race)
+		{
+			ctx.concrete = true;
+			const std::string raceLabel = SanitizePathComponent(raceForm->GetEditorID() ? raceForm->GetEditorID() : "Unknown");
+			const char* sexLabel = (sex == 1) ? "F" : "M";
+			ctx.speakerInfo = raceLabel + "\\" + sexLabel;
+			ctx.outputFolder = ctx.speakerInfo;
+		}
+
+		if (idForm && (idForm->typeID == kFormType_NPC || idForm->typeID == kFormType_Creature))
+		{
+			ctx.concrete = true;
+			const std::string idLabel = SanitizePathComponent(idForm->GetEditorID() ? idForm->GetEditorID() : "Unknown");
+			const char* sexLabel = (sex == 1) ? "F" : "M";
+			ctx.speakerInfo = std::string("NPC\\") + idLabel + "\\" + sexLabel;
+			if (ctx.outputFolder == "Unknown\\M") {
+				ctx.outputFolder = ctx.speakerInfo;
+			}
+		}
+
+		return ctx;
 	}
 
-	void RunRevoiceImport()
+	bool FindParentTopicAndQuest(DataHandler* handler, EditorTopicInfo* target, TESTopic*& outTopic, TESQuest*& outQuest)
 	{
-		char filePath[MAX_PATH] = {};
-		OPENFILENAMEA ofn{};
+		outTopic = nullptr;
+		outQuest = nullptr;
+		if (!handler || !target) {
+			return false;
+		}
+
+		for (tList<TESTopic>::Iterator topicIt = handler->topics.Begin(); !topicIt.End() && topicIt.Get(); ++topicIt)
+		{
+			TESTopic* topic = topicIt.Get();
+			if (!topic) {
+				continue;
+			}
+			for (TESTopic::QuestInfoEntry* qEntry = topic->questInfoList; qEntry; qEntry = qEntry->next)
+			{
+				if (!qEntry->data) {
+					continue;
+				}
+				for (UInt32 i = 0; i < qEntry->data->infoList.numObjs; ++i)
+				{
+					TESTopicInfo* info = qEntry->data->infoList.data[i];
+					if ((void*)info == (void*)target) {
+						outTopic = topic;
+						outQuest = qEntry->data->parentQuest;
+						return true;
+					}
+				}
+			}
+		}
+
+		return false;
+	}
+
+	std::string BuildRevoiceOutputPath(EditorTopicInfo* info, TESTopic* topic, TESQuest* quest, EditorResponseData* response, const SpeakerContext& ctx)
+	{
+		ModEntry::Data* activeFile = GetActivePlugin();
+		if (!info || !topic || !quest || !response || !activeFile || !ctx.concrete) {
+			return "";
+		}
+
+		const char* questIDRaw = quest->GetEditorID();
+		const char* topicIDRaw = topic->GetEditorID();
+		if (!questIDRaw || !topicIDRaw) {
+			return "";
+		}
+		const std::string questID = SanitizePathComponent(questIDRaw);
+		const std::string topicID = SanitizePathComponent(topicIDRaw);
+
+		char buffer[MAX_PATH * 2] = {0};
+		snprintf(buffer, sizeof(buffer),
+			"Sound\\Voice\\%s\\%s\\%s_%s_%08X_%u.mp3",
+			activeFile->name,
+			ctx.outputFolder.c_str(),
+			questID.c_str(),
+			topicID.c_str(),
+			(info->base.refID & 0xFFFFFF),
+			response->responseNumber);
+
+		return NormalizeVoiceOutputPath(buffer);
+	}
+
+	std::vector<RevoiceRow> ParseRevoiceFile(const std::string& filePath, ImportSummary& summary)
+	{
+		std::vector<RevoiceRow> rows;
+		std::ifstream input(filePath, std::ios::binary);
+		if (!input.good()) {
+			summary.errors++;
+			summary.diagnostics.push_back("Couldn't open selected file.");
+			return rows;
+		}
+
+		std::string line;
+		UInt32 lineNo = 0;
+		while (std::getline(input, line))
+		{
+			++lineNo;
+			if (lineNo == 1 && line.size() >= 3 && (unsigned char)line[0] == 0xEF && (unsigned char)line[1] == 0xBB && (unsigned char)line[2] == 0xBF) {
+				line = line.substr(3);
+			}
+			if (!line.empty() && line.back() == '\r') {
+				line.pop_back();
+			}
+			if (Trim(line).empty()) {
+				continue;
+			}
+
+			auto fields = ParseDelimitedLine(line, '\t');
+			if (fields.size() < 5) {
+				fields = ParseDelimitedLine(line, ',');
+			}
+			if (fields.size() < 5) {
+				summary.errors++;
+				summary.diagnostics.push_back("Line " + std::to_string(lineNo) + ": malformed row.");
+				continue;
+			}
+			if (lineNo == 1 && _stricmp(Trim(fields[0]).c_str(), "FormID") == 0) {
+				continue;
+			}
+
+			RevoiceRow row;
+			row.lineNumber = lineNo;
+			if (!ParseHexFormID(fields[0], row.formID)) {
+				summary.errors++;
+				summary.diagnostics.push_back("Line " + std::to_string(lineNo) + ": invalid FormID.");
+				continue;
+			}
+			row.voiceID = Trim(fields[1]);
+			row.speakerInfo = Trim(fields[2]);
+			row.outputPath = NormalizeVoiceOutputPath(fields[3]);
+			row.dialogue = Trim(fields[4]);
+			row.responseNumber = ParseResponseNumberFromPath(row.outputPath);
+
+			if (row.outputPath.empty() || row.dialogue.empty() || row.responseNumber == 0) {
+				summary.errors++;
+				summary.diagnostics.push_back("Line " + std::to_string(lineNo) + ": invalid path/dialogue/response number.");
+				continue;
+			}
+
+			rows.push_back(std::move(row));
+		}
+		return rows;
+	}
+
+	void ShowImportSummary(const ImportSummary& summary)
+	{
+		std::ostringstream ss;
+		ss << "reVoice import complete.\n\n"
+			<< "Parsed rows: " << summary.parsedRows << "\n"
+			<< "Updated responses: " << summary.applied << "\n"
+			<< "Skipped rows: " << summary.skipped << "\n"
+			<< "Warnings (dialogue mismatch): " << summary.dialogueMismatch << "\n"
+			<< "Warnings (output path mismatch): " << summary.pathMismatch << "\n"
+			<< "Warnings (other): " << summary.warnings << "\n"
+			<< "Parse/validation errors: " << summary.errors;
+		MessageBoxA(g_editorMainWindow, ss.str().c_str(), "Import reVoice CSV -> Active Plugin", MB_OK | MB_ICONINFORMATION);
+	}
+
+	void ImportRevoiceCsvToActivePlugin()
+	{
+		DataHandler* handler = GetEditorDataHandler();
+		ModEntry::Data* activeFile = GetActivePlugin();
+		if (!handler || !activeFile) {
+			MessageBoxA(g_editorMainWindow, "An active plugin must be set before using this tool.", "Import reVoice CSV", MB_OK | MB_ICONERROR);
+			return;
+		}
+
+		char filePath[MAX_PATH] = {0};
+		OPENFILENAMEA ofn = {0};
 		ofn.lStructSize = sizeof(ofn);
 		ofn.hwndOwner = g_editorMainWindow;
-		ofn.lpstrFilter = "reVoice CSV/TSV\0*.csv;*.tsv;*.txt\0All Files\0*.*\0";
+		ofn.lpstrFilter = "reVoice CSV/TSV\0*.csv;*.tsv;*.txt\0All Files\0*.*\0\0";
 		ofn.lpstrFile = filePath;
-		ofn.nMaxFile = MAX_PATH;
-		ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-		ofn.lpstrTitle = "Import reVoice CSV to Active Plugin";
-
+		ofn.nMaxFile = sizeof(filePath);
+		ofn.lpstrTitle = "Select reVoice export CSV/TSV";
+		ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
 		if (!GetOpenFileNameA(&ofn)) {
 			return;
 		}
 
-		ImportSummary summary{};
-		ModEntry::Data* activeFile = GetActivePlugin();
-		if (!activeFile) {
-			MessageBoxA(g_editorMainWindow, "No active plugin is set.", "reVoice CSV -> Active Plugin", MB_OK | MB_ICONERROR);
-			return;
-		}
-
-		auto rows = ParseRevoiceFile(filePath, summary);
-		summary.processed = static_cast<UInt32>(rows.size());
+		ImportSummary summary;
+		std::vector<RevoiceRow> rows = ParseRevoiceFile(filePath, summary);
+		summary.parsedRows = static_cast<UInt32>(rows.size());
 
 		std::unordered_map<UInt32, size_t> lastRowForForm;
 		for (size_t i = 0; i < rows.size(); ++i) {
@@ -362,24 +478,186 @@ namespace
 
 		for (size_t i = 0; i < rows.size(); ++i)
 		{
-			if (lastRowForForm[rows[i].formID] != i) {
+			const RevoiceRow& row = rows[i];
+			if (lastRowForForm[row.formID] != i) {
 				summary.warnings++;
-				summary.diagnostics.push_back("Line " + std::to_string(rows[i].lineNumber) + ": duplicate FormID, overwritten by later row.");
 				continue;
 			}
-			ApplyRowToActivePlugin(rows[i], activeFile, summary);
+
+			TESForm* form = EditorLookupFormByID ? EditorLookupFormByID(row.formID) : nullptr;
+			if (!form || form->typeID != kFormType_DialogInfo) {
+				summary.skipped++;
+				continue;
+			}
+			if ((form->flags & TESForm::kFormFlags_FromActiveFile) == 0) {
+				summary.skipped++;
+				continue;
+			}
+
+			EditorTopicInfo* info = reinterpret_cast<EditorTopicInfo*>(form);
+			const SpeakerContext ctx = BuildSpeakerContext(info);
+			if (!ctx.concrete) {
+				summary.skipped++;
+				continue;
+			}
+
+			EditorResponseData* targetResponse = nullptr;
+			for (tList<EditorResponseData>::Iterator rIt = info->responseList.Begin(); !rIt.End() && rIt.Get(); ++rIt)
+			{
+				EditorResponseData* response = rIt.Get();
+				if (response && response->responseNumber == row.responseNumber) {
+					targetResponse = response;
+					break;
+				}
+			}
+			if (!targetResponse) {
+				summary.skipped++;
+				continue;
+			}
+
+			TESTopic* parentTopic = nullptr;
+			TESQuest* parentQuest = nullptr;
+			FindParentTopicAndQuest(handler, info, parentTopic, parentQuest);
+			const std::string expectedPath = BuildRevoiceOutputPath(info, parentTopic, parentQuest, targetResponse, ctx);
+			if (!expectedPath.empty() && _stricmp(expectedPath.c_str(), row.outputPath.c_str()) != 0) {
+				summary.pathMismatch++;
+			}
+
+			const char* existing = targetResponse->responseText.m_data ? targetResponse->responseText.m_data : "";
+			if (_stricmp(Trim(existing).c_str(), row.dialogue.c_str()) != 0) {
+				summary.dialogueMismatch++;
+			}
+
+			targetResponse->responseText.Set(row.dialogue.c_str());
+			form->SetFromActiveFile(true);
+			summary.applied++;
 		}
 
-		ShowSummaryDialog(summary);
+		ShowImportSummary(summary);
+	}
+
+	std::string EscapeDialogueForTsv(const std::string& in)
+	{
+		std::string out = in;
+		for (char& ch : out) {
+			if (ch == '\t' || ch == '\r' || ch == '\n') {
+				ch = ' ';
+			}
+		}
+		return out;
+	}
+
+	void ExportRevoiceCsvForActivePlugin()
+	{
+		DataHandler* handler = GetEditorDataHandler();
+		ModEntry::Data* activeFile = GetActivePlugin();
+		if (!handler || !activeFile) {
+			MessageBoxA(g_editorMainWindow, "An active plugin must be set before using this tool.", "Export reVoice CSV", MB_OK | MB_ICONERROR);
+			return;
+		}
+
+		char filePath[MAX_PATH] = {0};
+		snprintf(filePath, sizeof(filePath), "%s_revoice.csv", activeFile->name);
+
+		OPENFILENAMEA ofn = {0};
+		ofn.lStructSize = sizeof(ofn);
+		ofn.hwndOwner = g_editorMainWindow;
+		ofn.lpstrFilter = "CSV Files\0*.csv\0All Files\0*.*\0\0";
+		ofn.lpstrFile = filePath;
+		ofn.nMaxFile = sizeof(filePath);
+		ofn.lpstrTitle = "Export reVoice CSV for active plugin";
+		ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+		if (!GetSaveFileNameA(&ofn)) {
+			return;
+		}
+
+		std::ofstream out(filePath, std::ios::binary | std::ios::trunc);
+		if (!out.good()) {
+			MessageBoxA(g_editorMainWindow, "Couldn't create output CSV file.", "Export reVoice CSV", MB_OK | MB_ICONERROR);
+			return;
+		}
+
+		out << "FormID\tVoiceID\tSpeakerInfo\tOutputPath\tDialogue\n";
+		int exported = 0;
+		int skipped = 0;
+
+		for (tList<TESTopic>::Iterator topicIt = handler->topics.Begin(); !topicIt.End() && topicIt.Get(); ++topicIt)
+		{
+			TESTopic* topic = topicIt.Get();
+			if (!topic) {
+				continue;
+			}
+
+			for (TESTopic::QuestInfoEntry* qEntry = topic->questInfoList; qEntry; qEntry = qEntry->next)
+			{
+				if (!qEntry->data || !qEntry->data->parentQuest) {
+					continue;
+				}
+
+				for (UInt32 i = 0; i < qEntry->data->infoList.numObjs; ++i)
+				{
+					TESTopicInfo* baseInfo = qEntry->data->infoList.data[i];
+					if (!baseInfo) {
+						continue;
+					}
+					TESForm* baseForm = reinterpret_cast<TESForm*>(baseInfo);
+					if ((baseForm->flags & TESForm::kFormFlags_FromActiveFile) == 0) {
+						continue;
+					}
+
+					EditorTopicInfo* info = reinterpret_cast<EditorTopicInfo*>(baseForm);
+					const SpeakerContext ctx = BuildSpeakerContext(info);
+					if (!ctx.concrete) {
+						++skipped;
+						continue;
+					}
+
+					for (tList<EditorResponseData>::Iterator rIt = info->responseList.Begin(); !rIt.End() && rIt.Get(); ++rIt)
+					{
+						EditorResponseData* response = rIt.Get();
+						if (!response) {
+							continue;
+						}
+
+						const std::string outPath = BuildRevoiceOutputPath(info, topic, qEntry->data->parentQuest, response, ctx);
+						if (outPath.empty()) {
+							++skipped;
+							continue;
+						}
+
+						char formIDBuffer[16] = {0};
+						snprintf(formIDBuffer, sizeof(formIDBuffer), "%08X", baseForm->refID);
+						const char* text = response->responseText.m_data ? response->responseText.m_data : "";
+						out << formIDBuffer << '\t'
+							<< ctx.voiceID << '\t'
+							<< ctx.speakerInfo << '\t'
+							<< outPath << '\t'
+							<< EscapeDialogueForTsv(text) << '\n';
+						++exported;
+					}
+				}
+			}
+		}
+
+		std::ostringstream ss;
+		ss << "reVoice export complete.\n\nExported rows: " << exported << "\nSkipped rows: " << skipped << "\nOutput: " << filePath;
+		MessageBoxA(g_editorMainWindow, ss.str().c_str(), "Export reVoice CSV <- Active Plugin", MB_OK | MB_ICONINFORMATION);
 	}
 
 	LRESULT CALLBACK HookedEditorWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	{
-		if (message == WM_COMMAND) {
-			const UINT cmdID = LOWORD(wParam);
-			if (cmdID == kMenuCommand_ImportRevoiceCsv) {
-				RunRevoiceImport();
+		if (message == WM_COMMAND)
+		{
+			switch (LOWORD(wParam))
+			{
+			case kMenuCommand_ImportRevoiceCsv:
+				ImportRevoiceCsvToActivePlugin();
 				return 0;
+			case kMenuCommand_ExportRevoiceCsv:
+				ExportRevoiceCsvForActivePlugin();
+				return 0;
+			default:
+				break;
 			}
 		}
 		return CallWindowProc(g_originalMainWndProc, hWnd, message, wParam, lParam);
@@ -396,29 +674,30 @@ namespace
 			g_editorMainWindow = GetForegroundWindow();
 		}
 		if (!g_editorMainWindow) {
-			_MESSAGE("reVoice import: could not find editor main window");
+			_MESSAGE("reVoice: could not locate editor main window");
 			return false;
 		}
 
 		HMENU mainMenu = GetMenu(g_editorMainWindow);
 		if (!mainMenu) {
-			_MESSAGE("reVoice import: editor main menu missing");
+			_MESSAGE("reVoice: editor menu not found");
 			return false;
 		}
 
 		HMENU fileMenu = GetSubMenu(mainMenu, 0);
 		if (!fileMenu) {
-			_MESSAGE("reVoice import: file menu missing");
+			_MESSAGE("reVoice: file menu not found");
 			return false;
 		}
 
 		AppendMenuA(fileMenu, MF_SEPARATOR, 0, nullptr);
-		AppendMenuA(fileMenu, MF_STRING, kMenuCommand_ImportRevoiceCsv, kMenuLabel);
+		AppendMenuA(fileMenu, MF_STRING, kMenuCommand_ImportRevoiceCsv, kMenuLabel_Import);
+		AppendMenuA(fileMenu, MF_STRING, kMenuCommand_ExportRevoiceCsv, kMenuLabel_Export);
 		DrawMenuBar(g_editorMainWindow);
 
 		g_originalMainWndProc = (WNDPROC)SetWindowLongPtr(g_editorMainWindow, GWLP_WNDPROC, (LONG_PTR)HookedEditorWndProc);
 		g_menuInstalled = (g_originalMainWndProc != nullptr);
-		_MESSAGE("reVoice import: menu installed = %d", g_menuInstalled ? 1 : 0);
+		_MESSAGE("reVoice: menu installed=%d", g_menuInstalled ? 1 : 0);
 		return g_menuInstalled;
 	}
 }
@@ -436,9 +715,9 @@ DEFINE_COMMAND_PLUGIN(PluginExampleFunctionsTest, "Prints Hello to the Log and C
 
 const bool IsCompatible(const OBSEInterface* obse)
 {
-	if(obse->isEditor)
+	if (obse->isEditor)
 	{
-		if(obse->editorVersion < SUPPORTED_RUNTIME_VERSION_CS) {
+		if (obse->editorVersion < SUPPORTED_RUNTIME_VERSION_CS) {
 			_MESSAGE("ERROR::IsCompatible: Editor incorrect editor version (got %08X need at least %08X)", obse->editorVersion, SUPPORTED_RUNTIME_VERSION_CS);
 			_ERROR("ERROR::IsCompatible: Editor incorrect editor version (got %08X need at least %08X)", obse->editorVersion, SUPPORTED_RUNTIME_VERSION_CS);
 			return false;
@@ -460,9 +739,9 @@ bool OBSEPlugin_Query(const OBSEInterface* obse, PluginInfo* info)
 	_MESSAGE(PLUGIN_VERSION_INFO);
 	_MESSAGE("Plugin_Query: Querying");
 
-	info->infoVersion =	PluginInfo::kInfoVersion;
-	info->name =		PLUGIN_NAME_LONG;
-	info->version =		PLUGIN_VERSION_DLL;
+	info->infoVersion = PluginInfo::kInfoVersion;
+	info->name = PLUGIN_NAME_LONG;
+	info->version = PLUGIN_VERSION_DLL;
 
 	if (!IsCompatible(obse)) {
 		_MESSAGE("ERROR::Plugin_Query: Incompatible | Disabling Plugin");
