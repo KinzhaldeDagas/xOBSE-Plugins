@@ -25,7 +25,6 @@
 #include <shlobj.h>
 #include <windows.h>
 #include <commdlg.h>
-#include <shlwapi.h>
 
 PluginHandle g_pluginHandle = kPluginHandle_Invalid;
 
@@ -86,6 +85,18 @@ namespace
 	}
 
 
+	bool ContainsTokenCaseInsensitive(const char* haystack, const char* token)
+	{
+		if (!haystack || !token) {
+			return false;
+		}
+		std::string h(haystack);
+		std::string t(token);
+		std::transform(h.begin(), h.end(), h.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+		std::transform(t.begin(), t.end(), t.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+		return h.find(t) != std::string::npos;
+	}
+
 	bool MenuTextContains(HMENU menu, int index, const char* token)
 	{
 		char buffer[256] = {0};
@@ -100,7 +111,7 @@ namespace
 		if (info.fType & MFT_SEPARATOR) {
 			return false;
 		}
-		return StrStrIA(buffer, token) != nullptr;
+		return ContainsTokenCaseInsensitive(buffer, token);
 	}
 
 	HMENU FindOrCreateFilePopup(HMENU fileMenu, const char* token)
