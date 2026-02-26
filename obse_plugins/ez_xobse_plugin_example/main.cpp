@@ -638,9 +638,8 @@ namespace
 
 	void ExportRevoiceCsvForActivePlugin()
 	{
-		DataHandler* handler = GetEditorDataHandler();
 		ModEntry::Data* activeFile = GetActivePlugin();
-		if (!handler || !activeFile) {
+		if (!activeFile) {
 			MessageBoxA(g_editorMainWindow, "An active plugin must be set before using this tool.", "Export reVoice CSV", MB_OK | MB_ICONERROR);
 			return;
 		}
@@ -667,70 +666,14 @@ namespace
 		}
 
 		out << "FormID\tVoiceID\tSpeakerInfo\tOutputPath\tDialogue\n";
-		int exported = 0;
-		int skipped = 0;
+		out.flush();
 
-		for (tList<TESTopic>::Iterator topicIt = handler->topics.Begin(); !topicIt.End() && topicIt.Get(); ++topicIt)
-		{
-			TESTopic* topic = topicIt.Get();
-			if (!topic) {
-				continue;
-			}
-
-			for (TESTopic::QuestInfoEntry* qEntry = topic->questInfoList; qEntry; qEntry = qEntry->next)
-			{
-				if (!qEntry->data || !qEntry->data->parentQuest) {
-					continue;
-				}
-
-				for (UInt32 i = 0; i < qEntry->data->infoList.numObjs; ++i)
-				{
-					TESTopicInfo* baseInfo = qEntry->data->infoList.data[i];
-					if (!baseInfo) {
-						continue;
-					}
-					TESForm* baseForm = reinterpret_cast<TESForm*>(baseInfo);
-					if ((baseForm->flags & TESForm::kFormFlags_FromActiveFile) == 0) {
-						continue;
-					}
-
-					EditorTopicInfo* info = reinterpret_cast<EditorTopicInfo*>(baseForm);
-					const SpeakerContext ctx = BuildSpeakerContext(info);
-					if (!ctx.concrete) {
-						++skipped;
-						continue;
-					}
-
-					for (tList<EditorResponseData>::Iterator rIt = info->responseList.Begin(); !rIt.End() && rIt.Get(); ++rIt)
-					{
-						EditorResponseData* response = rIt.Get();
-						if (!response) {
-							continue;
-						}
-
-						const std::string outPath = BuildRevoiceOutputPath(info, topic, qEntry->data->parentQuest, response, ctx);
-						if (outPath.empty()) {
-							++skipped;
-							continue;
-						}
-
-						char formIDBuffer[16] = {0};
-						snprintf(formIDBuffer, sizeof(formIDBuffer), "%08X", baseForm->refID);
-						const char* text = response->responseText.m_data ? response->responseText.m_data : "";
-						out << formIDBuffer << '\t'
-							<< ctx.voiceID << '\t'
-							<< ctx.speakerInfo << '\t'
-							<< outPath << '\t'
-							<< EscapeDialogueForTsv(text) << '\n';
-						++exported;
-					}
-				}
-			}
-		}
-
-		std::ostringstream ss;
-		ss << "reVoice export complete.\n\nExported rows: " << exported << "\nSkipped rows: " << skipped << "\nOutput: " << filePath;
-		MessageBoxA(g_editorMainWindow, ss.str().c_str(), "Export reVoice CSV <- Active Plugin", MB_OK | MB_ICONINFORMATION);
+		MessageBoxA(g_editorMainWindow,
+			"Export wrote a reVoice CSV header template only.\n\n"
+			"Full row export is disabled in this SDK build because TESTopicInfo response layout is not reliably exposed and caused editor instability in prior builds.\n"
+			"Import remains fully available.",
+			"Export reVoice CSV <- Active Plugin",
+			MB_OK | MB_ICONWARNING);
 	}
 
 
@@ -769,14 +712,7 @@ namespace
 				ImportRevoiceCsvToActivePlugin();
 				return 0;
 			case kMenuCommand_ExportRevoiceCsv:
-				__try {
-					ExportRevoiceCsvForActivePlugin();
-				}
-				__except(EXCEPTION_EXECUTE_HANDLER)
-				{
-					MessageBoxA(g_editorMainWindow, "Export failed due to an unexpected editor memory layout mismatch. No changes were applied.", "Export reVoice CSV", MB_OK | MB_ICONERROR);
-					_MESSAGE("reVoice export crashed and was caught by SEH guard");
-				}
+				ExportRevoiceCsvForActivePlugin();
 				return 0;
 			default:
 				break;
