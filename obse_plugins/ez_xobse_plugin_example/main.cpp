@@ -627,7 +627,6 @@ namespace
 
 	void ExportRevoiceCsvForActivePlugin()
 	{
-		__try {
 		DataHandler* handler = GetEditorDataHandler();
 		ModEntry::Data* activeFile = GetActivePlugin();
 		if (!handler || !activeFile) {
@@ -721,12 +720,6 @@ namespace
 		std::ostringstream ss;
 		ss << "reVoice export complete.\n\nExported rows: " << exported << "\nSkipped rows: " << skipped << "\nOutput: " << filePath;
 		MessageBoxA(g_editorMainWindow, ss.str().c_str(), "Export reVoice CSV <- Active Plugin", MB_OK | MB_ICONINFORMATION);
-		}
-		__except(EXCEPTION_EXECUTE_HANDLER)
-		{
-			MessageBoxA(g_editorMainWindow, "Export failed due to an unexpected editor memory layout mismatch. No changes were applied.", "Export reVoice CSV", MB_OK | MB_ICONERROR);
-			_MESSAGE("reVoice export crashed and was caught by SEH guard");
-		}
 	}
 
 
@@ -765,7 +758,14 @@ namespace
 				ImportRevoiceCsvToActivePlugin();
 				return 0;
 			case kMenuCommand_ExportRevoiceCsv:
-				ExportRevoiceCsvForActivePlugin();
+				__try {
+					ExportRevoiceCsvForActivePlugin();
+				}
+				__except(EXCEPTION_EXECUTE_HANDLER)
+				{
+					MessageBoxA(g_editorMainWindow, "Export failed due to an unexpected editor memory layout mismatch. No changes were applied.", "Export reVoice CSV", MB_OK | MB_ICONERROR);
+					_MESSAGE("reVoice export crashed and was caught by SEH guard");
+				}
 				return 0;
 			default:
 				break;
